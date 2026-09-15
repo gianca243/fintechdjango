@@ -1,0 +1,1 @@
+from fintech.views.user import UserView
