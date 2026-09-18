@@ -18,128 +18,147 @@ Estilo acordado: **"pistas + revisión"**
 - Dar una pista conceptual (qué mirar, qué API, qué concepto) — nunca la solución completa.
 - El usuario escribe el código.
 - Se revisa lo que escribió señalando errores/gaps concretos (con número de línea), sin corregirlo directamente en el archivo.
-- Solo se escala a pseudocódigo o un ejemplo mínimo **genérico** (nunca del archivo real) cuando el usuario pide explícitamente que se le explique un concepto nuevo (ej. `Protocol`, `@dataclass`, excepciones custom, `Decimal`, stub vs fake).
-- Cuando el usuario pregunta algo conceptual ("¿qué es DI?", "no sé cómo hacer X"), se le explica el concepto con un ejemplo genérico no relacionado a su dominio, y después vuelve a escribir él su versión real.
-- Cuando el usuario pide explícitamente una opinión de diseño ("¿qué opinás?", "¿voy bien?"), sí se le da una recomendación directa con el razonamiento — pero la decisión final queda en sus manos.
-- Excepción: verificaciones diagnósticas de solo lectura (correr `manage.py shell`/`pytest` para confirmar que algo funciona, `git status`, instalar dependencias que el usuario pidió explícitamente) sí las puede hacer el asistente — no es "hacerle el código", es confirmar que lo que escribió funciona o preparar el entorno que pidió.
+- Solo se escala a pseudocódigo o un ejemplo mínimo **genérico** (nunca del archivo real) cuando el usuario pide explícitamente que se le explique un concepto nuevo (ej. `Protocol`, `@dataclass`, `__post_init__`, excepciones custom, `Decimal`, stub vs fake, class-based views/`as_view()`, `asdict`).
+- Cuando el usuario pregunta algo conceptual, se le explica con un ejemplo genérico no relacionado a su dominio, y después vuelve a escribir él su versión real.
+- Cuando el usuario pide explícitamente una opinión de diseño ("¿qué opinás?", "¿voy bien?"), sí se le da una recomendación directa con el razonamiento — pero la decisión final queda en sus manos. El usuario ya viene aplicando por su cuenta criterios de sesiones anteriores a decisiones nuevas (ver ejemplo en el punto 8 de arquitectura) — cuando eso pase, vale la pena nombrarlo explícitamente, refuerza el aprendizaje.
+- Excepción: verificaciones diagnósticas de solo lectura (correr `manage.py shell`/`pytest`/test client, `git status`, instalar dependencias o generar migraciones que el usuario pidió/necesita explícitamente) sí las puede hacer el asistente.
 
 ## Decisiones de arquitectura tomadas
 
-### 1. Capas: domain / infrastructure / controllers (aplicación)
+### 1. Capas: domain / infrastructure / controllers / views (aplicación)
 
 ```
 fintech/
   domain/            # Python puro, CERO imports de Django
     user.py           # entidad User (dataclass)
     repository.py      # UserRepository (Protocol/contrato)
-    exceptions.py       # UserNotFound
+    exceptions.py       # todas las excepciones de dominio
   infrastructure/      # sabe de Django, implementa los contratos del dominio
     user_repository.py  # DjangoUserRepository (implementa UserRepository)
   controllers/          # capa de orquestación/aplicación
     users.py             # UserController — depende de UserRepository vía DI, nunca de Django directo
-  models/                # ya existía: los models.Model de Django (filas de la tabla)
-  views/                  # ya existía: DRF views — es la capa HTTP, responsable de convertir
-                          #   HttpRequest/DRF Request a dict plano antes de pasarlo al controller
-  test/                    # tests con pytest (carpeta nueva, distinta del tests.py default de Django)
+  models/                # los models.Model de Django (filas de la tabla)
+  views/                  # capa HTTP (DRF APIView) — convierte HttpRequest/Response
+                          #   a/desde dicts planos, mapea excepciones de dominio a status codes
+  urls.py                 # URLconf de la app fintech, incluido desde senior_test/urls.py
+  test/                    # tests con pytest
+    fake_repository.py      # fakes en memoria (FakeUserRepository, FakeTransactionRepository)
+    test_user_controllers.py
+    test_transaction_controllers.py
 ```
 
 **Por qué esta separación:** Dependency Inversion Principle (la D de SOLID). Los módulos de alto nivel (dominio, orquestación) no dependen de infraestructura (Django); ambos dependen de una abstracción (`Protocol`). La infraestructura implementa esa abstracción, no al revés.
 
-### 2. `User` de dominio es un Active Record → se descartó. Se eligió Opción B (DDD puro)
+### 2. `User` de dominio: Opción B (DDD puro), no Active Record
 
-Se discutieron dos opciones:
-- **Opción A (pragmática):** `User(models.Model)` con reglas de negocio como métodos directamente en el modelo Django.
-- **Opción B (DDD puro, la elegida):** entidad de dominio en Python plano, desacoplada de Django, con un Repository que mapea entre el dominio y el ORM.
-
-**Por qué B:** el usuario quiere tests unitarios que no toquen la base de datos, y quiere practicar inyección de dependencias explícitamente. B es la que lo permite.
+Entidad de dominio en Python plano, desacoplada de Django, con un Repository que mapea entre el dominio y el ORM — elegido para poder tener tests unitarios que no toquen la base de datos, y para practicar DI explícitamente.
 
 ### 3. `UserRepository` es un `typing.Protocol`, no un `abc.ABC`
 
-Se explicó la diferencia (nominal typing vs structural typing / duck typing). Se eligió `Protocol` porque encaja mejor con el objetivo de poder pasar un `FakeUserRepository` en los tests sin necesidad de heredar de nada.
-
-**Contrato final de `UserRepository`** (`domain/repository.py`):
+**Contrato final** (`domain/repository.py`):
 ```python
 class UserRepository(Protocol):
     def get_by_id(self, user_id: int) -> User: ...
     def get_by_email(self, email: str) -> User: ...
     def save(self, user: User) -> User: ...
+    def exists_by_email(self, email: str) -> bool: ...
 ```
-- Sin `delete` — decisión consciente (YAGNI). En un dominio financiero probablemente nunca se borra un `User` de verdad (auditoría/regulación); si hace falta inhabilitar, a futuro se agregaría un campo `active` en vez de un delete real. No implementar hasta que haga falta.
-- `save` es **upsert único** (reemplaza a tener `create`/`update` separados). Aprovecha que `Model.save()` de Django ya decide INSERT vs UPDATE según si `pk` es `None` o no — mismo patrón se aplicó en el dominio y en `FakeUserRepository`.
-- Lectura por `id` **o** `email`: se decidió por **dos métodos explícitos** (`get_by_id`, `get_by_email`) en vez de uno flexible con parámetros opcionales, para evitar ambigüedad y tipar mejor.
-- **No encontrado → excepción propia** (`UserNotFound(value: str | int, param: str)`), no `None`.
-- **⚠️ Todavía sin resolver:** esto puede no ser ideal para casos donde "no encontrado" es un resultado esperado (ej. chequear si un email ya existe antes de crear un user) — ahí usar excepciones para control de flujo normal es mal visto. **Pendiente para cuando se implemente la validación de email único en `create_user`** — capaz conviene un método aparte tipo `exists_by_email(email) -> bool`.
+- Sin `delete` — YAGNI consciente (dominio financiero, probablemente inhabilitar con un campo `active` a futuro en vez de borrar).
+- `save` es **upsert único**. `exists_by_email` se agregó para la validación de email duplicado (ver punto 6) — la lógica de negocio de "¿esto es válido?" vive en el controller, no en el repository (`save` no valida nada, solo persiste).
+- Lectura por `id` **o** `email`: dos métodos explícitos, no uno flexible.
+- No encontrado → excepción propia (`UserNotFound(value, param)`), no `None`.
 
 ### 4. Tipos de dinero: `Decimal`, nunca `float`
 
-`float` tiene errores de precisión binaria (`0.1 + 0.2 != 0.3`). Django ya usa `Decimal` internamente para `DecimalField`, así que el dominio sigue el mismo tipo. Si se necesita construir un `Decimal` desde un literal, hacerlo desde string (`Decimal("0.1")`), nunca desde un float (`Decimal(0.1)`), porque hereda la imprecisión.
+Django ya usa `Decimal` internamente para `DecimalField`; el dominio sigue el mismo tipo. Construir siempre desde string (`Decimal("0.1")`), nunca desde float.
 
-**⚠️ Deuda técnica pendiente:** `UserController.create_user` (ver más abajo) todavía tiene `balance=0` (int) en vez de `Decimal("0")` — se detectó en la fase de refactor del ciclo TDD pero no se corrigió todavía. Es lo primero para retocar mañana.
+### 5. Aggregate `User` + `Transaction` — **en construcción activa ahora mismo**
 
-### 5. Aggregate identificado: `User` + `Transaction`
+Identificado por el usuario solo: un retiro/depósito necesita crear una `Transaction` **y** actualizar `balance` del `User` **atómicamente**. `User` = Aggregate Root, `Transaction` = miembro del aggregate.
 
-El usuario identificó esto solo, sin que se le sugiriera: un retiro/depósito necesita crear una `Transaction` **y** actualizar `balance` del `User` **atómicamente** — si uno pasa sin el otro, el sistema queda en estado inválido. Eso es la definición de un DDD Aggregate.
+**Decisiones ya tomadas:**
+- La entidad `User` va a exponer métodos de comportamiento (`retirar(monto)`, `depositar(monto)`) en vez de que el controller manipule `balance` y cree `Transaction` como pasos sueltos.
+- `Transaction` (dominio) necesita: `id`, `user_id`, `amount`, un campo de **dirección** (depósito vs retiro — nombre y valores todavía sin decidir, ver pendientes), y `status` (resultado de la operación: éxito/fallo — para las pruebas actuales solo se usa `"success"`). Importante: `status` (resultado) y el campo de dirección son **dos campos distintos**, no el mismo.
+- Se prefirió un campo de dirección explícito en vez de guardar montos negativos — más claro, evita bugs de signo, más parecido a cómo lo hacen sistemas contables reales.
+- Validación de fondos suficientes: sí, `retirar()` debe validarlo. Excepción `NotEnoughFunds(balance, withdrawal_value)` ya escrita en `domain/exceptions.py` (typo corregido: era `__ini__`, se arregló a `__init__`).
+- **Qué devuelven `retirar()`/`depositar()`:** el usuario propuso primero devolver un "bulto" con monto + nombre/email del user + nuevo balance (pensado para la respuesta HTTP), y se le hizo notar que esto es exactamente el mismo error que ya había descartado con `create_user` (el dominio no debe armar formatos de presentación). Se corrigió solo: ahora la decisión es que `retirar()`/`depositar()` devuelvan la `Transaction` (con su relación al `User` vía `user_id`), y que sea la capa HTTP/vista quien arme cualquier formato de respuesta combinando datos. Confirmado, buen ejemplo de aplicar un criterio ya aprendido a un caso nuevo.
+- Cuidado de nomenclatura: hay dos conceptos llamados "transacción" — la entidad de dominio `Transaction` y la transacción de base de datos (`django.db.transaction.atomic`, que se va a necesitar para persistir el aggregate completo).
 
-- **Aggregate Root = `User`** (único punto de entrada).
-- **`Transaction`** es miembro del aggregate — tiene identidad propia pero su ciclo de vida está atado al `User` (confirmado por el modelo Django existente: `Transaction.user` es FK, no hay relación entre dos `User`s, o sea no son transferencias entre cuentas, son operaciones sobre una sola cuenta).
-- Implicación de diseño (**todavía no implementada**): el `UserController` no debería crear una `Transaction` y actualizar `balance` como dos pasos sueltos. La entidad `User` de dominio debería exponer un método de comportamiento (ej. `user.retirar(monto)`) que garantice ambos cambios juntos.
-- Cuidado de nomenclatura: hay dos conceptos llamados "transacción" — la entidad de dominio `Transaction` y la transacción de base de datos (`django.db.transaction.atomic`). No confundir cuando se implemente la persistencia del aggregate completo.
-- Pendiente: decidir si `User` (dataclass) queda mutable o inmutable. Se dejó **mutable por ahora**, a revisar cuando se implemente `retirar()`/el aggregate completo.
+**⚠️ Pendiente sin resolver — preguntado, sin respuesta todavía:**
+1. **¿`User` mutable o inmutable?** Se volvió a preguntar explícitamente ahora que `retirar()`/`depositar()` están en juego (mutable = modifica `self.balance` in-place; inmutable = devuelve un `User` nuevo). **El usuario todavía no contestó esto** — es lo primero para resolver antes de escribir `retirar()`.
+2. **Nombre y valores del campo de dirección en `Transaction`** (¿`type`? ¿`direction`? ¿`"DEPOSITO"/"RETIRO"` o en inglés?) — todavía sin decidir.
+3. El modelo Django `Transaction` (`models/transaction.py`) todavía no tiene el campo de dirección — cuando se decida el nombre, va a hacer falta otra migración (mismo patrón que se usó para agregar `balance` a `User`, ver "Infraestructura de testing").
 
-### 6. `@dataclass` para entidades de dominio
+**Plan de ataque acordado:** empezar por la pieza más aislada — `User.retirar()`/`depositar()` como comportamiento de dominio puro, testeado directo (sin repository, sin controller, sin fake). Recién después conectar con persistencia del aggregate completo (ahí entra `atomic`, y probablemente un método nuevo en el repository tipo `save_with_transaction` o similar — todavía no discutido en detalle).
 
-`domain/user.py`:
-```python
-@dataclass
-class User:
-    name: str
-    email: str
-    balance: Decimal
-    id: Optional[int] = None
-```
-Regla de Python recordada: los campos sin valor default van antes que los que sí tienen default — por eso `id` (con default `None`, porque un `User` nuevo aún no tiene id asignado por la DB) va al final.
+### 6. `@dataclass` con `__post_init__` para invariantes de dominio
+
+`domain/user.py` valida en `__post_init__` que `name`/`email` no sean `None` ni `""`, y junta **todos** los campos inválidos en una lista antes de lanzar una sola excepción (`NotAValidUser(fields: list)`) — en vez de cortar en el primer error. Idea del usuario, buena porque da mejor feedback que fallar en el primer campo encontrado.
+
+Se decidió explícitamente **no usar Pydantic** para esto — razonamiento: Pydantic es para validar datos externos en la frontera (rol que ya cumplen los `Serializer` de DRF), no para reglas de negocio de una entidad de dominio; sumarlo ahí duplicaría con lo que DRF ya va a hacer en la vista, y rompería la regla de "dominio sin dependencias externas".
 
 ### 7. `request_data` es un `dict` plano — conversión HTTP la hace la vista
 
-Decisión del usuario, confirmada como correcta: `UserController.create_user(request_data: dict)` recibe un dict simple. La conversión de `HttpRequest`/DRF `Request` a ese dict es responsabilidad de `UserView` (capa HTTP) — el controller nunca debe saber que Django/DRF existen. Mismo principio DIP que el resto del diseño. **Todavía no se actualizó `UserView` para hacer esta conversión y llamar al controller** (sigue con el placeholder viejo).
+`UserController.create_user`/`get_data` reciben dicts simples. La vista (`UserView`) es responsable de convertir `HttpRequest`/DRF `Request` a esos dicts.
 
-### 8. `create_user` devuelve el `User` de dominio, no un dict
+### 8. Los métodos de dominio/controller devuelven objetos tipados, nunca dicts armados a mano
 
-Se discutió explícitamente (el usuario preguntó "¿qué opinás?"). Decisión: devolver el `User` (dataclass), no un dict armado a mano.
+`create_user` devuelve el `User` de dominio (no un dict) — razonamiento: un dict pierde autocompletado/chequeo de tipos, y armar el shape de la respuesta es responsabilidad de presentación (DRF `Serializer`s, o `asdict()` + la vista), no del controller (SRP). Mismo criterio aplicado luego por el propio usuario a `retirar()`/`depositar()` (ver punto 5).
 
-**Por qué:** un dict obliga a acordarse de claves como string (sin autocompletado, sin chequeo de tipos); el `User` tipado es un contrato más fuerte para cualquier caller (view, test, un futuro comando de consola). El problema real que motivaba el dict — "que el view lo pueda convertir a JSON fácil" — ya tiene solución idiomática en DRF: los `Serializer`. Que el controller arme el JSON a mano sería mezclarle una responsabilidad de presentación (viola SRP). Esto además resuelve solo la inconsistencia que había entre `create_user` (usaba `"name"`) y `get_data` (usaba `"username"`) — deja de ser problema del controller.
+### 9. `UserController` no guarda estado de instancia entre llamadas
 
-**Pendiente:** `get_data()` también debería revisarse con este mismo criterio cuando se rediseñe (ver punto 9).
+`create_user` no guarda `self.user`. Consecuencia: `get_data(request_data: dict)` recibe `{"id": ...}` como parámetro (no state guardado), y usa `self.user_repo.get_by_id(...)`. Valida el `id` con una guarda propia (`NotParamsProvided`) antes de llamar al repository.
 
-### 9. `UserController` NO guarda el usuario creado como estado de instancia
+## Mapeo de excepciones de dominio → HTTP status (ya implementado en `UserView`)
 
-Se decidió explícitamente que `create_user` no debe guardar `self.user` (o similar) después de crear. Consecuencia: `get_data()` (que antes leía `self.user.name` etc. asumiendo que el constructor recibía un usuario puntual) quedó **sin rediseñar** — hoy es `pass`. Camino más probable cuando se retome: que reciba un `user_id` como parámetro y use `self.user_repo.get_by_id(user_id)`, ya que ese método ya existe y funciona tanto en `DjangoUserRepository` como en `FakeUserRepository`. No se cerró esta decisión todavía, queda para cuando se escriba el test de `get_data`.
+| Excepción | Status | Nota |
+|---|---|---|
+| `UserNotFound` | 404 | no encontrado |
+| `EmailIsRegistered` | 409 Conflict | datos válidos, pero choca con estado existente (no 400) |
+| `NotAValidUser` | 400 Bad Request | datos mal formados/faltantes |
+| `NotParamsProvided` | 400 Bad Request | falta un parámetro de búsqueda |
+| `NotEnoughFunds` | *(todavía sin vista que la use)* | pendiente cuando se conecte `retirar`/`depositar` a HTTP |
 
-## Infraestructura de testing
+Patrón en la vista: cada except arma `Response({"error": str(e)}, status=...)`, reusando el mensaje que cada excepción ya construye en su propio `super().__init__(...)`.
 
-- Se instaló `pytest` (ya estaba en el venv) + `pytest-django==4.14.0`.
-- `pytest.ini` en la raíz, con `DJANGO_SETTINGS_MODULE = senior_test.settings` y `python_files = test/*.py tests.py`.
-- `requirements.txt` estaba corrupto (generado con PowerShell en UTF-16, se leía con espacios entre cada carácter) — se regeneró limpio con `pip freeze` desde bash.
-- Convención de nombres de pytest que ya causó bugs reales en la sesión — **recordar siempre**: clases de test deben empezar con `Test` (mayúscula), métodos con `test_` (minúscula). Un nombre mal puesto no da error, simplemente "0 tests collected" en silencio.
-- Los tests actuales (dominio puro + `FakeUserRepository`) **no necesitan** `django.test.TestCase`, alcanza con clases simples (estilo `pytest`) sin heredar de nada — no tocan la base de datos, así que no hace falta el overhead de setup/teardown de DB que sí trae `django.test.TestCase`.
+## Class-based views de DRF — concepto cubierto esta sesión
+
+El usuario viene de FastAPI/Express (routing función-por-endpoint) y se explicó la mecánica de Django/DRF: `path()` necesita una función `request -> response`; una clase (`APIView`) no sirve directo, por eso `.as_view()` devuelve una función-dispatcher que internamente elige qué método de la clase llamar (`get`/`post`/etc.) según `request.method`. Un solo `path()` alcanza para todos los verbos que la clase implemente — no se configura por separado. Si el verbo no está implementado, DRF devuelve `405` solo.
+
+**Convención de path param vs. query param** (discutida, la extensión de "buscar por email" quedó explícitamente pospuesta, el usuario dijo "sigamos con las vistas como íbamos"): path param para identidad primaria del recurso (`/user/<int:id>/`), query param para filtros/búsquedas alternativas (`/user/?email=...`). Pendiente si se retoma: extender `get_data` para aceptar `{"email": ...}` además de `{"id": ...}`, despachando a `get_by_email`.
+
+## Infraestructura de testing y HTTP — verificado funcionando de punta a punta
+
+- `pytest` + `pytest-django==4.14.0` instalados, `pytest.ini` con `DJANGO_SETTINGS_MODULE`.
+- Se generó y aplicó `fintech/migrations/0002_user_balance.py` (el campo `balance` de `User` nunca había sido migrado desde que se agregó al modelo).
+- Se probó el flujo HTTP real completo (vía `django.test.Client`, sin levantar servidor) — los 5 status codes salen correctos: `201` crear, `200` obtener, `404` no encontrado, `409` email duplicado, `400` campos vacíos.
+- Convención de nombres de pytest — **recordar siempre**: clases `Test*`, métodos `test_*`. Un nombre mal puesto da "0 tests collected" en silencio, sin error.
+- `senior_test/urls.py` usa `path('', include('fintech.urls'))` (prefijo vacío — `fintech/urls.py` ya incluye `"user/"` en sus propios patrones; usar un prefijo no vacío ahí duplicaría el path). `name=` no es compatible con `include()` en el mismo `path()` (rompe el arranque de Django si se combinan).
 
 ## Estado actual del código
 
-- ✅ `fintech/domain/user.py` — entidad `User`, completa y correcta.
-- ✅ `fintech/domain/repository.py` — `Protocol UserRepository`, completo y correcto.
-- ✅ `fintech/domain/exceptions.py` — `UserNotFound(value: str | int, param: str)`, completo y correcto.
-- ✅ `fintech/infrastructure/user_repository.py` — `DjangoUserRepository`, completo, revisado, y verificado que importa sin errores contra Django real.
-- ✅ `fintech/test/test_controllers.py` — contiene `FakeUserRepository` (fake real con estado en memoria, dos dicts `_by_id`/`_by_email`) y `TestUserController.test_insert_user`, que **pasa** (verificado con `pytest`, 1 passed).
-- ⏳ `fintech/controllers/users.py` — `UserController.__init__` recibe `user_repo: UserRepository` vía DI (correcto). `create_user` implementado y con test en verde, pero con la deuda del punto 4 (`balance=0` debería ser `Decimal("0")`), y sin ninguna validación todavía (email duplicado, campos vacíos). `get_data()` es `pass`, sin rediseñar (ver punto 9).
-- ⏳ `fintech/views/user.py` — sigue con el placeholder original (`{"message": "Hello, World!"}` / `"User created successfully!"`), no llama todavía a `UserController`.
-- ⚠️ Hallazgo pendiente de prolijar (no bloqueante, preexistente): `fintech/models/__init__.py` hace `from .transaction import User, Transaction` — `User` en realidad está definido en `models/user.py`, funciona solo porque `transaction.py` lo re-exporta indirectamente (import transitivo frágil). Corregir en algún momento a `from .user import User` + `from .transaction import Transaction`.
+- ✅ `fintech/domain/user.py` — entidad `User` con `__post_init__` (valida `name`/`email`), completa.
+- ✅ `fintech/domain/repository.py` — `Protocol UserRepository` (4 métodos), completo.
+- ✅ `fintech/domain/exceptions.py` — 5 excepciones: `UserNotFound`, `EmailIsRegistered`, `NotAValidUser`, `NotParamsProvided`, `NotEnoughFunds`. Todas completas y con el dato relevante guardado en `self`.
+- ✅ `fintech/infrastructure/user_repository.py` — `DjangoUserRepository`, completo (los 4 métodos del Protocol).
+- ✅ `fintech/controllers/users.py` — `UserController` con `create_user` y `get_data` completos, con validaciones y DI.
+- ✅ `fintech/views/user.py` — `UserView` completo: `get`/`post`, excepciones mapeadas a status codes, `asdict` para el body.
+- ✅ `fintech/urls.py` + `senior_test/urls.py` — conectados vía `include()`, dos patrones (`user/`, `user/<int:id>/`).
+- ✅ `fintech/test/fake_repository.py` — `FakeUserRepository` (completo, con estado real en memoria) + `FakeTransactionRepository` (recién creada, `pass`, vacía).
+- ✅ `fintech/test/test_user_controllers.py` — 5 tests, todos pasando.
+- ⏳ `fintech/test/test_transaction_controllers.py` — 1 test (`test_create_deposit`), todavía `pass`, sin escribir.
+- ⏳ `domain/transaction.py` — **no existe todavía**, es lo próximo a crear.
+- ⏳ `User.retirar()`/`User.depositar()` — no implementados, bloqueados por la decisión de mutabilidad pendiente (ver punto 5).
+- ⚠️ Hallazgo pendiente de prolijar (no bloqueante, preexistente): `fintech/models/__init__.py` hace `from .transaction import User, Transaction` en vez de `from .user import User`.
 
-## Próximos pasos (para retomar mañana)
+## Próximos pasos (para retomar)
 
-En orden sugerido:
-1. Refactor rápido: `balance=0` → `Decimal("0")` en `create_user` (deuda del punto 4).
-2. Seguir el ciclo TDD para `create_user` con casos nuevos — el que se dejó pendiente explícitamente es **email duplicado**: escribir el test primero, y ahí sí resolver la pregunta abierta del punto 3 (`exists_by_email` vs `get_by_email` + `except UserNotFound`).
-3. Validaciones básicas de `create_user` (¿`name`/`email` vacíos o ausentes?).
-4. Rediseñar y testear `get_data()` (ver punto 9 — probablemente con `user_id` como parámetro).
-5. Conectar `UserView` con `UserController` de verdad (ver punto 7 — hoy el view sigue con el placeholder).
-6. Más adelante: `User.retirar(monto)` / `User.depositar(monto)` en el dominio y la persistencia atómica del aggregate completo (`User` + `Transaction`) vía `DjangoUserRepository` (entra `django.db.transaction.atomic` — ver punto 5).
+1. **Resolver la mutabilidad de `User` pendiente** (pregunta sin contestar, ver punto 5) — bloquea todo lo demás de `retirar()`.
+2. Decidir nombre/valores del campo de dirección en `Transaction`.
+3. Crear `domain/transaction.py` (entidad `Transaction`, dataclass).
+4. Escribir test de dominio puro para `User.retirar()`/`depositar()` (sin repository) — TDD, empezando por el caso feliz y el de fondos insuficientes (`NotEnoughFunds`).
+5. Implementar `retirar()`/`depositar()` en `User`.
+6. Recién ahí: persistencia del aggregate completo — nuevo método de repository (persistir `User` actualizado + `Transaction` nueva atómicamente, con `django.db.transaction.atomic`), actualizar `Protocol`, `DjangoUserRepository`, y completar `FakeTransactionRepository`/`FakeUserRepository` en los fakes.
+7. Migración nueva en Django para el campo de dirección de `Transaction`.
+8. `TransactionController` (o extender `UserController`) + vista HTTP para retiro/depósito, con `NotEnoughFunds` mapeada a un status code (sin decidir todavía — probablemente 400 o 422).
+9. Más adelante, si se retoma: extender `get_data` para buscar también por `email` vía query param (pospuesto, no descartado).

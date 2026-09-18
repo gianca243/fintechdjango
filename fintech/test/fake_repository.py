@@ -1,6 +1,5 @@
 from fintech.domain.user import User
 from fintech.domain.exceptions import UserNotFound
-from fintech.controllers.users import UserController
 class FakeUserRepository:
     def __init__(self):
         self._by_id = {}
@@ -32,6 +31,9 @@ class FakeUserRepository:
         self._by_email[user.email] = temp_result
         return self._to_domain_with_user(temp_result)
 
+    def exists_by_email(self, email: str) -> bool:
+        return self._by_email.get(email) is not None
+
     def _to_domain_with_user(self, user_model: dict) -> User:
         return User(
             id=user_model.get('id'),
@@ -40,14 +42,5 @@ class FakeUserRepository:
             balance=user_model.get('balance')
         )
 
-class TestUserController:
-    def test_insert_user(self):
-        user_controller = UserController(FakeUserRepository())
-        user_result = user_controller.create_user({
-            "name": 'test',
-            "email": 'test@mail.com',
-        })
-
-        assert user_result.balance == 0
-        assert user_result.name == 'test'
-        assert user_result.email == 'test@mail.com'
+class FakeTransactionRepository:
+    pass

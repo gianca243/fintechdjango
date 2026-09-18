@@ -10,3 +10,6 @@ class UserRepository(Protocol):
 
     def save(self, user: User) -> User:
         ...
+
+    def exists_by_email(self, email: str) -> bool:
+        ...

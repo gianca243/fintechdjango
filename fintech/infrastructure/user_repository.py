@@ -1,6 +1,6 @@
 from fintech.domain.user import User
 from fintech.models import User as UserModel
-from fintech.domain.exceptions import UserNotFound
+from fintech.domain.exceptions import UserNotFound, EmailIsRegistered
 
 class DjangoUserRepository():
 
@@ -27,6 +27,10 @@ class DjangoUserRepository():
         )
         _user.save()
         return self._to_domain(_user)
+
+    def exists_by_email(self, email: str) -> bool:
+        return UserModel.objects.filter(email=email).exists()
+
 
     def _to_domain(self, user_model: UserModel) -> User:
         return User(
